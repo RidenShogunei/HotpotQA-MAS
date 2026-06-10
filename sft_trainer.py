@@ -174,7 +174,7 @@ def train_lora(model, tokenizer, train_data: List[Dict], config: TrainingConfig,
             optimizer.zero_grad()
             num_batches += 1
 
-        avg_loss = total_loss / max(num_batches * config.sft_gradient_accumulation_steps, 1)
+        avg_loss = total_loss / max(num_batches, 1)
         print(f"Epoch {epoch + 1}/{config.sft_epochs} - Loss: {avg_loss:.4f}")
 
     save_selected_adapter(model, tokenizer, output_dir, adapter_id)
