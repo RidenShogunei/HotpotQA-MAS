@@ -486,7 +486,7 @@ class HotpotMASGRPOTrainer:
 def parse_args():
     parser = argparse.ArgumentParser(description="Train HotpotQA Main/Sub MAS agents.")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--sft-dir", default="./hotpotqa_mas_sft_checkpoints")
+    parser.add_argument("--sft-dir", default="./artifacts/checkpoints/mas_sft")
     parser.add_argument("--main-lora", default=None)
     parser.add_argument("--sub-lora", default=None)
     parser.add_argument("--save-dir", default="./artifacts/checkpoints/mas_grpo")

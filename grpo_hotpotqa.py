@@ -274,7 +274,7 @@ class HotpotGRPOTrainer:
 def parse_args():
     parser = argparse.ArgumentParser(description="Train HotpotQA Main/Sub agents with GRPO-style updates.")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--sft-dir", default="./hotpotqa_sft_checkpoints")
+    parser.add_argument("--sft-dir", default="./artifacts/checkpoints/sft")
     parser.add_argument("--save-dir", default="./artifacts/checkpoints/direct_grpo")
     parser.add_argument("--train-jsonl", default="./data/base/train.jsonl")
     parser.add_argument("--val-jsonl", default="./data/base/val.jsonl")

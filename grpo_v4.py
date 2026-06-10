@@ -29,10 +29,10 @@ def clipped_grpo_objective(
 @dataclass
 class CoTrainConfig:
     base_model: str = "Qwen/Qwen3.5-9B"
-    sft_dir: str = "./sft_checkpoints"
+    sft_dir: str = "./artifacts/checkpoints/sft"
     main_lora_path: str | None = None
     sub_lora_path: str | None = None
-    save_dir: str = "./grpo_checkpoints"
+    save_dir: str = "./artifacts/checkpoints/grpo"
     lr: float = 5e-6
     group_size: int = 2
     reward_threshold: float = 0.3

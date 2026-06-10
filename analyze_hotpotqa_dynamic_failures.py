@@ -124,8 +124,8 @@ def write_summary(path: Path, rows):
 def parse_args():
     parser = argparse.ArgumentParser(description="Trace dynamic MAS failures.")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--main-lora", default="./hotpotqa_dynamic_synthesis_mainonly_500x1/main_agent")
-    parser.add_argument("--sub-lora", default="./hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent")
+    parser.add_argument("--main-lora", required=True)
+    parser.add_argument("--sub-lora", required=True)
     parser.add_argument("--val-jsonl", default="./data/enhanced/val.jsonl")
     parser.add_argument("--out-dir", default="./artifacts/eval/dynamic_failures")
     parser.add_argument("--offset", type=int, default=40)

@@ -10,30 +10,6 @@ import analyze_hotpotqa_dynamic_mas_results as dynamic_eval
 from hotpotqa_environment import HotpotQAEnvironment
 
 
-DYNAMIC_MODELS = [
-    {
-        "name": "dynamic_mixture_v3",
-        "main_lora": "./hotpotqa_dynamic_mixture_sft_300x1_v3/main_agent",
-        "sub_lora": "./hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent",
-    },
-    {
-        "name": "dynamic_synthesis_500x1",
-        "main_lora": "./hotpotqa_dynamic_synthesis_mainonly_500x1/main_agent",
-        "sub_lora": "./hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent",
-    },
-    {
-        "name": "dynamic_synthesis_subevidence_replay_500x1",
-        "main_lora": "./hotpotqa_dynamic_synthesis_mainonly_500x1/main_agent",
-        "sub_lora": "./hotpotqa_dynamic_sub_evidence_replay_500x1/sub_agent",
-    },
-    {
-        "name": "dynamic_verifier_500x1",
-        "main_lora": "./hotpotqa_dynamic_verifier_mainonly_500x1/main_agent",
-        "sub_lora": "./hotpotqa_dynamic_mixture_sft_300x1_v3/sub_agent",
-    },
-]
-
-
 def write_jsonl(path: Path, row):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -101,9 +77,11 @@ def write_markdown(path: Path, rows):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run dynamic HotpotQA MAS multi-offset evaluation.")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
+    parser.add_argument("--name", default="dynamic_mas")
+    parser.add_argument("--main-lora", required=True)
+    parser.add_argument("--sub-lora", required=True)
     parser.add_argument("--val-jsonl", default="./data/enhanced/val.jsonl")
     parser.add_argument("--out-dir", default="./artifacts/eval/dynamic_suite")
-    parser.add_argument("--model-names", nargs="*", default=[])
     parser.add_argument("--offsets", type=int, nargs="+", default=[0, 20, 40])
     parser.add_argument("--tasks", type=int, default=20)
     parser.add_argument("--samples", type=int, default=2)
@@ -124,39 +102,34 @@ def main():
         out_jsonl.unlink()
 
     rows = []
-    specs = [spec for spec in DYNAMIC_MODELS if not args.model_names or spec["name"] in args.model_names]
-    for spec in specs:
-        print(f"[suite:dynamic] loading {spec['name']}", flush=True)
-        model, tokenizer = dynamic_eval.load_model(args.base_model, spec["main_lora"], spec["sub_lora"], device)
-        for offset in args.offsets:
-            torch.manual_seed(args.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(args.seed)
-            tasks = load_tasks(args.val_jsonl, offset, args.tasks)
-            print(f"[suite:dynamic] model={spec['name']} offset={offset} tasks={len(tasks)}", flush=True)
-            metrics = dynamic_eval.evaluate(
-                model,
-                tokenizer,
-                tasks,
-                device,
-                args.samples,
-                args.max_tokens,
-                args.sub_steps,
-                args.max_subagents,
-            )
-            row = {
-                "suite": "dynamic_mas",
-                "model": spec["name"],
-                "offset": offset,
-                "tasks": len(tasks),
-                "samples": args.samples,
-                **metrics,
-            }
-            write_jsonl(out_jsonl, row)
-            rows.append(row)
-        del model
+    print(f"[suite:dynamic] loading {args.name}", flush=True)
+    model, tokenizer = dynamic_eval.load_model(args.base_model, args.main_lora, args.sub_lora, device)
+    for offset in args.offsets:
+        torch.manual_seed(args.seed)
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.manual_seed_all(args.seed)
+        tasks = load_tasks(args.val_jsonl, offset, args.tasks)
+        print(f"[suite:dynamic] model={args.name} offset={offset} tasks={len(tasks)}", flush=True)
+        metrics = dynamic_eval.evaluate(
+            model,
+            tokenizer,
+            tasks,
+            device,
+            args.samples,
+            args.max_tokens,
+            args.sub_steps,
+            args.max_subagents,
+        )
+        row = {
+            "suite": "dynamic_mas",
+            "model": args.name,
+            "offset": offset,
+            "tasks": len(tasks),
+            "samples": args.samples,
+            **metrics,
+        }
+        write_jsonl(out_jsonl, row)
+        rows.append(row)
 
     write_markdown(out_dir / "summary.md", rows)
     print(f"[suite:dynamic] wrote {out_jsonl}", flush=True)

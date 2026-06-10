@@ -10,18 +10,6 @@ import analyze_hotpotqa_results as direct_eval
 from hotpotqa_environment import HotpotQAEnvironment
 
 
-DIRECT_MODELS = [
-    {
-        "name": "direct_sft",
-        "lora": "./hotpotqa_sft_checkpoints/main_agent/main",
-    },
-    {
-        "name": "direct_grpo_150x3",
-        "lora": "./hotpotqa_grpo_150x3_answerbest/best/main",
-    },
-]
-
-
 def write_jsonl(path: Path, row):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -63,6 +51,8 @@ def write_markdown(path: Path, rows):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run direct Main multi-offset HotpotQA evaluation.")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
+    parser.add_argument("--name", default="direct")
+    parser.add_argument("--lora", required=True)
     parser.add_argument("--val-jsonl", default="./data/base/val.jsonl")
     parser.add_argument("--out-dir", default="./artifacts/eval/direct_suite")
     parser.add_argument("--offsets", type=int, nargs="+", default=[0, 20, 40])
@@ -85,38 +75,34 @@ def main():
         out_jsonl.unlink()
 
     rows = []
-    for spec in DIRECT_MODELS:
-        print(f"[suite:direct] loading {spec['name']}", flush=True)
-        model, tokenizer = direct_eval.load_model(args.base_model, spec["lora"], device)
-        for offset in args.offsets:
-            torch.manual_seed(args.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(args.seed)
-            tasks = load_tasks(args.val_jsonl, offset, args.tasks)
-            print(f"[suite:direct] model={spec['name']} offset={offset} tasks={len(tasks)}", flush=True)
-            metrics = direct_eval.evaluate(
-                model,
-                tokenizer,
-                tasks,
-                device,
-                args.samples,
-                args.max_tokens,
-                not args.raw,
-                args.research_steps,
-            )
-            row = {
-                "suite": "direct",
-                "model": spec["name"],
-                "offset": offset,
-                "tasks": len(tasks),
-                "samples": args.samples,
-                **metrics,
-            }
-            write_jsonl(out_jsonl, row)
-            rows.append(row)
-        del model
+    print(f"[suite:direct] loading {args.name}", flush=True)
+    model, tokenizer = direct_eval.load_model(args.base_model, args.lora, device)
+    for offset in args.offsets:
+        torch.manual_seed(args.seed)
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.manual_seed_all(args.seed)
+        tasks = load_tasks(args.val_jsonl, offset, args.tasks)
+        print(f"[suite:direct] model={args.name} offset={offset} tasks={len(tasks)}", flush=True)
+        metrics = direct_eval.evaluate(
+            model,
+            tokenizer,
+            tasks,
+            device,
+            args.samples,
+            args.max_tokens,
+            not args.raw,
+            args.research_steps,
+        )
+        row = {
+            "suite": "direct",
+            "model": args.name,
+            "offset": offset,
+            "tasks": len(tasks),
+            "samples": args.samples,
+            **metrics,
+        }
+        write_jsonl(out_jsonl, row)
+        rows.append(row)
     write_markdown(out_dir / "summary.md", rows)
     print(f"[suite:direct] wrote {out_jsonl}", flush=True)
     print(f"[suite:direct] wrote {out_dir / 'summary.md'}", flush=True)

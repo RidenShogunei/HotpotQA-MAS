@@ -14,13 +14,6 @@ from generate_hotpotqa_mas_sft_data import MAIN_ANSWER_SYSTEM, oracle_subtask
 from hotpotqa_environment import HotpotQAEnvironment
 
 
-MAIN_MODELS = [
-    {"name": "mas_sft_v2", "main_lora": "./hotpotqa_mas_sft_checkpoints_v2/main_agent/main"},
-    {"name": "stage2_main_50x2", "main_lora": "./hotpotqa_mas_stage2_main_prefsub_50x2/best/main"},
-    {"name": "joint_30x1_main", "main_lora": "./hotpotqa_mas_joint_from_stage2_30x1/best/main"},
-]
-
-
 def load_model(base_model: str, main_lora: str, device: str):
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
@@ -152,6 +145,8 @@ def write_summary(path: Path, rows):
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Main with oracle Sub result.")
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
+    parser.add_argument("--name", default="main")
+    parser.add_argument("--main-lora", required=True)
     parser.add_argument("--val-jsonl", default="./data/base/val.jsonl")
     parser.add_argument("--out-dir", default="./artifacts/eval/main_oracle")
     parser.add_argument("--offsets", type=int, nargs="+", default=[0, 20, 40])
@@ -176,28 +171,24 @@ def main():
     if out_jsonl.exists():
         out_jsonl.unlink()
     rows = []
-    for spec in MAIN_MODELS:
-        print(f"[main-oracle] loading {spec['name']}", flush=True)
-        model, tokenizer = load_model(args.base_model, spec["main_lora"], device)
-        for offset in args.offsets:
-            torch.manual_seed(args.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(args.seed)
-            tasks = load_tasks(args.val_jsonl, offset, args.tasks)
-            print(f"[main-oracle] model={spec['name']} offset={offset} tasks={len(tasks)}", flush=True)
-            metrics = evaluate(model, tokenizer, tasks, device, args.samples, args.max_tokens, args.temperature)
-            row = {
-                "model": spec["name"],
-                "offset": offset,
-                "tasks": len(tasks),
-                "samples": args.samples,
-                **metrics,
-            }
-            write_jsonl(out_jsonl, row)
-            rows.append(row)
-        del model
+    print(f"[main-oracle] loading {args.name}", flush=True)
+    model, tokenizer = load_model(args.base_model, args.main_lora, device)
+    for offset in args.offsets:
+        torch.manual_seed(args.seed)
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.manual_seed_all(args.seed)
+        tasks = load_tasks(args.val_jsonl, offset, args.tasks)
+        print(f"[main-oracle] model={args.name} offset={offset} tasks={len(tasks)}", flush=True)
+        metrics = evaluate(model, tokenizer, tasks, device, args.samples, args.max_tokens, args.temperature)
+        row = {
+            "model": args.name,
+            "offset": offset,
+            "tasks": len(tasks),
+            "samples": args.samples,
+            **metrics,
+        }
+        write_jsonl(out_jsonl, row)
+        rows.append(row)
     write_summary(out_dir / "summary.md", rows)
     print(f"[main-oracle] wrote {out_jsonl}", flush=True)
     print(f"[main-oracle] wrote {out_dir / 'summary.md'}", flush=True)

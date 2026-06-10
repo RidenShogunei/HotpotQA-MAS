@@ -34,12 +34,12 @@ instances share the same Sub adapter.
 ```text
 data/base/       Original local HotpotQA benchmark
 data/enhanced/   Harder 30-document benchmark
-data/sft/        Reproducible SFT datasets
+data/sft/        Current dynamic MAS SFT datasets
 docs/            Experiment reports
 artifacts/       Local checkpoints and evaluation output (ignored by Git)
 ```
 
-Core scripts:
+Current training path:
 
 ```text
 hotpotqa_environment.py
@@ -47,12 +47,23 @@ generate_hotpotqa_mas_sft_data.py
 generate_hotpotqa_dynamic_mas_sft_data.py
 generate_hotpotqa_dynamic_mixture_sft_data.py
 generate_hotpotqa_dynamic_synthesis_sft_data.py
+generate_hotpotqa_dynamic_verifier_sft_data.py
 sft_trainer.py
-grpo_hotpotqa.py
 grpo_hotpotqa_mas.py
-grpo_hotpotqa_trl.py
 analyze_hotpotqa_dynamic_mas_results.py
 run_hotpotqa_dynamic_eval_suite.py
+```
+
+Baseline and diagnostic scripts are retained separately:
+
+```text
+grpo_hotpotqa.py
+analyze_hotpotqa_results.py
+analyze_hotpotqa_mas_results.py
+analyze_hotpotqa_sub_oracle.py
+analyze_hotpotqa_main_oracle_answer.py
+analyze_hotpotqa_dynamic_failures.py
+train_hotpotqa_sub_preferences.py
 ```
 
 ## Setup
@@ -79,6 +90,18 @@ data/base/val.jsonl
 data/enhanced/train.jsonl
 data/enhanced/val.jsonl
 ```
+
+The tracked SFT datasets are the current staged dynamic path:
+
+```text
+data/sft/hotpotqa_dynamic_mixture_sft_data_300_v3.jsonl
+data/sft/hotpotqa_dynamic_synthesis_sft_data_500.jsonl
+data/sft/hotpotqa_dynamic_verifier_sft_data_500.jsonl
+```
+
+Older direct/fixed/dynamic-v1 SFT files are intentionally not tracked. They can
+be regenerated with the corresponding `generate_*.py` scripts when a historical
+baseline needs to be reproduced.
 
 To regenerate them:
 
@@ -128,12 +151,15 @@ rate, direct rate, and average delegated subtask count.
 
 ## GRPO
 
-Two implementations are retained:
+The local shared-model implementation is:
 
 ```text
-grpo_hotpotqa_mas.py  Local shared-model Main/Sub implementation
-grpo_hotpotqa_trl.py  TRL-based single-policy reference implementation
+grpo_hotpotqa_mas.py
 ```
+
+`grpo_hotpotqa.py` is retained only as the direct/single-trajectory baseline.
+The former TRL single-policy prototype was removed because it did not implement
+the Main/Sub architecture and duplicated the direct baseline.
 
 Do not start joint GRPO from an unstable SFT checkpoint. The recommended
 experimental order is:
@@ -156,4 +182,3 @@ dynamic SFT
 
 See [docs/ENHANCED_HOTPOTQA_EVAL_REPORT.md](docs/ENHANCED_HOTPOTQA_EVAL_REPORT.md)
 and [docs/HOTPOTQA_MGRPO_REPORT.md](docs/HOTPOTQA_MGRPO_REPORT.md) for details.
-
