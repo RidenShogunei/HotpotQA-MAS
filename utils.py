@@ -65,16 +65,14 @@ def save_selected_adapter(model, tokenizer, output_dir: str, adapter_name: str):
 def set_trainable_adapter(model, adapter_id: str):
     """Set only the named LoRA adapter's params to requires_grad=True.
 
-    Version 4.0: fix needle matching for PEFT adapter naming.
+    Version 5.0: revert to correct needle matching.
     """
     if hasattr(model, "set_adapter"):
         model.set_adapter(adapter_id)
-    # PEFT adapter params end with .{adapter_id} (e.g., lora_A.main, lora_B.main)
-    # NOT .{adapter_id}.
-    needle = f".{adapter_id}"
+    needle = f".{adapter_id}."
     for name, param in model.named_parameters():
         if "lora_" in name:
-            param.requires_grad = name.endswith(needle)
+            param.requires_grad = needle in name
         else:
             param.requires_grad = False
 

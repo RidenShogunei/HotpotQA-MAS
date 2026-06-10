@@ -130,9 +130,15 @@ def train_lora(model, tokenizer, train_data: List[Dict], config: TrainingConfig,
                 padded_attention_mask.append(torch.cat([mask, torch.zeros(pad_len, dtype=torch.long)]))
                 labels_list.append(torch.cat([labels, torch.full((pad_len,), -100, dtype=torch.long)]))
 
-            input_ids = torch.stack(padded_input_ids).to(config.device)
-            attention_mask = torch.stack(padded_attention_mask).to(config.device)
-            labels = torch.stack(labels_list).to(config.device)
+            input_ids = torch.stack(padded_input_ids)
+            attention_mask = torch.stack(padded_attention_mask)
+            labels = torch.stack(labels_list)
+            # Move to the same device as the model's first parameter
+            # For device_map models, use the device of the embedding layer
+            device = model.get_input_embeddings().weight.device
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             shift_logits = outputs.logits[:, :-1, :].contiguous()
@@ -214,7 +220,7 @@ def main():
         sft_use_4bit=args.use_4bit,
         main_lora_path=args.main_lora,
         sub_lora_path=args.sub_lora,
-        device="cuda:0" if torch.cuda.is_available() else "cpu",
+        device="cuda:4" if torch.cuda.is_available() else "cpu",
     )
 
     print(f"PyTorch: {torch.__version__}")
@@ -237,15 +243,30 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-    # Use auto device_map to distribute across available GPUs
-    device_map = "auto" if torch.cuda.device_count() > 1 else {"": config.device}
-    print(f"[system] Using device_map: {device_map} (GPUs: {torch.cuda.device_count()})")
+    # Use GPUs 4,5,6 with manual device_map (avoid 0-3 used by vLLM)
+    # CRITICAL: include model.rotary_emb to avoid device mismatch in Qwen3.5
+    num_layers = 32
+    device_map = {
+        "model.embed_tokens": 4,
+        "model.rotary_emb": 4,
+        "model.norm": 6,
+        "lm_head": 6,
+    }
+    for i in range(num_layers):
+        if i < num_layers // 3:
+            device_map[f"model.layers.{i}"] = 4
+        elif i < 2 * num_layers // 3:
+            device_map[f"model.layers.{i}"] = 5
+        else:
+            device_map[f"model.layers.{i}"] = 6
+    print(f"[system] Using device_map across GPUs 4,5,6 ({len(device_map)} entries)")
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         trust_remote_code=True,
         quantization_config=quantization_config,
         device_map=device_map,
         low_cpu_mem_usage=True,
+        torch_dtype=torch.bfloat16,
     )
 
     main_samples, sub_samples = load_sft_data(args.data_path)
