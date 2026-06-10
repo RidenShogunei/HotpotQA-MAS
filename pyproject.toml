@@ -1,0 +1,44 @@
+[project]
+name = "hotpotqa-mas"
+version = "0.2.0"
+description = "Hierarchical Multi-Agent System for HotpotQA with GRPO training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "peft>=0.13",
+    "accelerate>=1.0",
+    "safetensors>=0.4",
+    "datasets>=3.0",
+    "wandb>=0.18",
+    "tqdm>=4.66",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+hotpot-prepare = "prepare_hotpotqa_data:main"
+hotpot-sft = "sft_trainer:main"
+hotpot-grpo = "grpo_hotpotqa_mas:main"
+hotpot-eval = "analyze_hotpotqa_dynamic_mas_results:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

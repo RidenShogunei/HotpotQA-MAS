@@ -1,10 +1,8 @@
-﻿"""SFT trainer for Main/Sub LoRA adapters."""
+"""SFT trainer for Main/Sub LoRA adapters.  Uses unified config.TrainingConfig."""
 
 import argparse
 import json
 import os
-import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
@@ -12,22 +10,14 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-
-@dataclass
-class CoTrainConfig:
-    base_model: str = "Qwen/Qwen3.5-9B"
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    target_modules: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
-    lr: float = 3e-4
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    num_epochs: int = 3
-    save_dir: str = "./sft_checkpoints"
-    device: str = "cuda:0"
-    use_4bit: bool = False
-    max_length: int = 1024
+from config import TrainingConfig
+from utils import (
+    dry_run_mode,
+    dry_run_warning,
+    save_selected_adapter,
+    set_trainable_adapter,
+    try_tqdm,
+)
 
 
 def load_sft_data(data_path: str) -> tuple[list[dict], list[dict]]:
@@ -73,44 +63,12 @@ def prepare_training_data(samples: List[Dict], tokenizer, max_length: int = 512)
         if (labels != -100).sum().item() == 0:
             continue
 
-        encodings.append(
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
-        )
+        encodings.append({
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        })
     return encodings
-
-
-def save_selected_adapter(model, tokenizer, output_dir: str, adapter_name: str):
-    os.makedirs(output_dir, exist_ok=True)
-    try:
-        model.save_pretrained(output_dir, selected_adapters=[adapter_name])
-    except TypeError:
-        model.save_pretrained(output_dir, adapter_name=adapter_name)
-    tokenizer.save_pretrained(output_dir)
-
-    nested_dir = os.path.join(output_dir, adapter_name)
-    if os.path.exists(os.path.join(nested_dir, "adapter_config.json")):
-        for item in os.listdir(nested_dir):
-            src = os.path.join(nested_dir, item)
-            dst = os.path.join(output_dir, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-
-
-def set_trainable_adapter(model, adapter_id: str):
-    if hasattr(model, "set_adapter"):
-        model.set_adapter(adapter_id)
-    needle = f".{adapter_id}."
-    for name, param in model.named_parameters():
-        if "lora_" in name:
-            param.requires_grad = needle in name
-        else:
-            param.requires_grad = False
 
 
 def add_or_load_adapter(model, lora_config: LoraConfig, adapter_id: str, lora_path: str | None):
@@ -125,27 +83,37 @@ def add_or_load_adapter(model, lora_config: LoraConfig, adapter_id: str, lora_pa
     return get_peft_model(model, lora_config, adapter_name=adapter_id)
 
 
-def train_lora(model, tokenizer, train_data: List[Dict], config: CoTrainConfig, adapter_name: str, output_dir: str):
+def train_lora(model, tokenizer, train_data: List[Dict], config: TrainingConfig, adapter_name: str, output_dir: str):
     print(f"\n{'=' * 60}")
     print(f"Training {adapter_name} Agent LoRA...")
     print(f"{'=' * 60}")
     print(f"Samples: {len(train_data)}")
-    print(f"Epochs: {config.num_epochs}")
-    print(f"LR: {config.lr}")
+    print(f"Epochs: {config.sft_epochs}")
+    print(f"LR: {config.sft_lr}  Batch: {config.sft_batch_size}  Accum: {config.sft_gradient_accumulation_steps}")
 
     adapter_id = adapter_name.lower()
     set_trainable_adapter(model, adapter_id)
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config.lr)
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad), lr=config.sft_lr,
+    )
     model.train()
 
-    for epoch in range(config.num_epochs):
+    num_batches_total = len(train_data) // config.sft_batch_size
+
+    for epoch in range(config.sft_epochs):
         total_loss = 0.0
         num_batches = 0
+        accum_count = 0
         indices = torch.randperm(len(train_data)).tolist()
 
-        for i in range(0, len(train_data), config.batch_size):
-            batch_indices = indices[i : i + config.batch_size]
-            if len(batch_indices) < config.batch_size:
+        pbar = try_tqdm(
+            range(0, len(train_data), config.sft_batch_size),
+            desc=f"Epoch {epoch + 1}/{config.sft_epochs} {adapter_name}",
+            total=num_batches_total,
+        )
+        for i in pbar:
+            batch_indices = indices[i : i + config.sft_batch_size]
+            if len(batch_indices) < config.sft_batch_size:
                 continue
 
             input_ids_list = [train_data[idx]["input_ids"] for idx in batch_indices]
@@ -153,9 +121,7 @@ def train_lora(model, tokenizer, train_data: List[Dict], config: CoTrainConfig, 
             label_ids_list = [train_data[idx]["labels"] for idx in batch_indices]
             max_len = max(ids.shape[0] for ids in input_ids_list)
 
-            padded_input_ids = []
-            padded_attention_mask = []
-            labels_list = []
+            padded_input_ids, padded_attention_mask, labels_list = [], [], []
             for ids, mask, labels in zip(input_ids_list, attention_mask_list, label_ids_list):
                 pad_len = max_len - ids.shape[0]
                 padded_input_ids.append(
@@ -175,26 +141,35 @@ def train_lora(model, tokenizer, train_data: List[Dict], config: CoTrainConfig, 
                 continue
 
             loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            ) / max(config.sft_gradient_accumulation_steps, 1)
+
             if not torch.isfinite(loss):
                 continue
 
             loss.backward()
             total_loss += loss.item()
-            num_batches += 1
+            accum_count += 1
 
-            if num_batches % config.gradient_accumulation_steps == 0:
+            if accum_count % config.sft_gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+                num_batches += 1
+                if hasattr(pbar, "set_postfix"):
+                    pbar.set_postfix(loss=f"{loss.item() * config.sft_gradient_accumulation_steps:.3f}", step=num_batches)
 
-        if num_batches % config.gradient_accumulation_steps != 0:
+        # remaining accumulated gradients
+        if accum_count % config.sft_gradient_accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
+            num_batches += 1
 
-        avg_loss = total_loss / max(num_batches, 1)
-        print(f"Epoch {epoch + 1}/{config.num_epochs} - Loss: {avg_loss:.4f}")
+        avg_loss = total_loss / max(num_batches * config.sft_gradient_accumulation_steps, 1)
+        print(f"Epoch {epoch + 1}/{config.sft_epochs} - Loss: {avg_loss:.4f}")
 
     save_selected_adapter(model, tokenizer, output_dir, adapter_id)
     print(f"LoRA weights saved to: {output_dir}")
@@ -208,18 +183,37 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--max-length", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--main-lora", default=None, help="Optional Main LoRA path to continue training from.")
     parser.add_argument("--sub-lora", default=None, help="Optional Sub LoRA path to continue training from.")
     parser.add_argument("--train-main", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train-sub", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-4bit", action="store_true", default=False)
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="Validate data loading and config without loading the model.")
     args = parser.parse_args()
 
-    config = CoTrainConfig(
+    if args.dry_run or dry_run_mode():
+        dry_run_warning("Testing data loading and config only.")
+        main_samples, sub_samples = load_sft_data(args.data_path)
+        print(f"  Main Agent: {len(main_samples)} samples")
+        print(f"  Sub Agent: {len(sub_samples)} samples")
+        print(f"  Config: epochs={args.epochs} lr={args.lr} batch={args.batch_size} ")
+        print("  [dry-run] All checks passed.  Ready for real training.")
+        return
+
+    config = TrainingConfig(
         base_model=args.base_model,
-        save_dir=args.save_dir,
-        num_epochs=args.epochs,
-        lr=args.lr,
-        max_length=args.max_length,
+        sft_dir=args.save_dir,
+        sft_lr=args.lr,
+        sft_epochs=args.epochs,
+        sft_max_length=args.max_length,
+        sft_batch_size=args.batch_size,
+        sft_gradient_accumulation_steps=args.gradient_accumulation_steps,
+        sft_use_4bit=args.use_4bit,
+        main_lora_path=args.main_lora,
+        sub_lora_path=args.sub_lora,
         device="cuda:0" if torch.cuda.is_available() else "cpu",
     )
 
@@ -236,7 +230,7 @@ def main():
 
     print("[system] Loading base model...")
     quantization_config = None
-    if config.use_4bit:
+    if config.sft_use_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -257,8 +251,8 @@ def main():
     print(f"  Sub Agent: {len(sub_samples)} samples")
 
     print("[system] Preparing training tensors...")
-    main_train_data = prepare_training_data(main_samples, tokenizer, max_length=config.max_length)
-    sub_train_data = prepare_training_data(sub_samples, tokenizer, max_length=config.max_length)
+    main_train_data = prepare_training_data(main_samples, tokenizer, max_length=config.sft_max_length)
+    sub_train_data = prepare_training_data(sub_samples, tokenizer, max_length=config.sft_max_length)
 
     lora_config = LoraConfig(
         r=config.lora_r,
@@ -271,19 +265,20 @@ def main():
 
     if args.train_main:
         print("\n[system] Adding/loading Main Agent LoRA adapter...")
-        model = add_or_load_adapter(model, lora_config, "main", args.main_lora)
+        model = add_or_load_adapter(model, lora_config, "main", config.main_lora_path)
         model.print_trainable_parameters()
-        train_lora(model, tokenizer, main_train_data, config, "Main", os.path.join(config.save_dir, "main_agent"))
+        train_lora(model, tokenizer, main_train_data, config, "Main",
+                   os.path.join(config.sft_dir, "main_agent"))
 
     if args.train_sub:
         print("\n[system] Adding/loading Sub Agent LoRA adapter...")
-        model = add_or_load_adapter(model, lora_config, "sub", args.sub_lora)
-        train_lora(model, tokenizer, sub_train_data, config, "Sub", os.path.join(config.save_dir, "sub_agent"))
+        model = add_or_load_adapter(model, lora_config, "sub", config.sub_lora_path)
+        train_lora(model, tokenizer, sub_train_data, config, "Sub",
+                   os.path.join(config.sft_dir, "sub_agent"))
 
     print("\n[system] SFT training complete.")
-    print(f"[system] Weights saved to: {config.save_dir}")
+    print(f"[system] Weights saved to: {config.sft_dir}")
 
 
 if __name__ == "__main__":
     main()
-
