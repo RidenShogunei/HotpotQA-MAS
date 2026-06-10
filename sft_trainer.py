@@ -237,11 +237,14 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
+    # Use auto device_map to distribute across available GPUs
+    device_map = "auto" if torch.cuda.device_count() > 1 else {"": config.device}
+    print(f"[system] Using device_map: {device_map} (GPUs: {torch.cuda.device_count()})")
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         trust_remote_code=True,
         quantization_config=quantization_config,
-        device_map={"": config.device},
+        device_map=device_map,
         low_cpu_mem_usage=True,
     )
 
