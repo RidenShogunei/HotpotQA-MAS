@@ -17,7 +17,7 @@ from analyze_hotpotqa_dynamic_mas_results import (
     run_sub_instance,
     sub_results_text,
 )
-from analyze_hotpotqa_mas_results import build_prompt, generate_one, load_model
+from analyze_hotpotqa_dynamic_mas_results import build_prompt, generate_one, load_model
 from hotpotqa_environment import HotpotQAEnvironment
 
 

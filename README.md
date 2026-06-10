@@ -1,74 +1,41 @@
-# HotpotQA Multi-Agent RL
+# HotpotQA Dynamic MAS
 
-Standalone research project for training and evaluating Main/Sub agent systems
-on local HotpotQA environments.
-
-This repository was extracted from a larger multi-benchmark workspace. It has
-no runtime dependency on that repository and contains only the HotpotQA line.
-
-## Research Architecture
-
-The current target is a dynamic hierarchical MAS:
+Standalone project for hierarchical Main/Sub training on HotpotQA.
 
 ```text
 Question + document catalog
-        |
-        v
-Main coordinator
-  |-- direct answer
-  `-- delegate 1..N focused research subtasks
-              |
-              v
-        shared Sub policy
-        search -> read -> summarize
-              |
-              v
-Main synthesis -> final answer + evidence
+        -> Main chooses direct or delegates 1..N subtasks
+        -> shared Sub policy searches, reads, and summarizes
+        -> Main synthesizes the final answer and evidence
 ```
 
-Main and Sub use a shared base model with separate LoRA adapters. Multiple Sub
-instances share the same Sub adapter.
-
-## Repository Layout
+## Structure
 
 ```text
-data/base/       Original local HotpotQA benchmark
-data/enhanced/   Harder 30-document benchmark
-data/sft/        Current dynamic MAS SFT datasets
-docs/            Experiment reports
-artifacts/       Local checkpoints and evaluation output (ignored by Git)
+data/base/       10-document local benchmark
+data/enhanced/   30-document benchmark
+data/sft/        Current staged SFT datasets
+docs/            Historical experiment reports
+artifacts/       Checkpoints and evaluation output, ignored by Git
 ```
 
-Current training path:
+The supported workflow has five entry points:
 
-```text
-hotpotqa_environment.py
-generate_hotpotqa_mas_sft_data.py
-generate_hotpotqa_dynamic_mas_sft_data.py
-generate_hotpotqa_dynamic_mixture_sft_data.py
-generate_hotpotqa_dynamic_synthesis_sft_data.py
-generate_hotpotqa_dynamic_verifier_sft_data.py
-sft_trainer.py
-grpo_hotpotqa_mas.py
-analyze_hotpotqa_dynamic_mas_results.py
-run_hotpotqa_dynamic_eval_suite.py
-```
+| Task | Command |
+|---|---|
+| Prepare data | `prepare_hotpotqa_data.py` |
+| Generate SFT | `generate_hotpotqa_dynamic_mixture_sft_data.py` |
+| Train SFT | `sft_trainer.py` |
+| Train GRPO | `grpo_hotpotqa_mas.py` |
+| Evaluate | `analyze_hotpotqa_dynamic_mas_results.py` |
 
-Baseline and diagnostic scripts are retained separately:
+`analyze_hotpotqa_dynamic_failures.py` is the only additional diagnostic
+entry point.
 
-```text
-grpo_hotpotqa.py
-analyze_hotpotqa_results.py
-analyze_hotpotqa_mas_results.py
-analyze_hotpotqa_sub_oracle.py
-analyze_hotpotqa_main_oracle_answer.py
-analyze_hotpotqa_dynamic_failures.py
-train_hotpotqa_sub_preferences.py
-```
+The other Python files are imported protocol/model helpers rather than
+separate workflows.
 
 ## Setup
-
-Python 3.10+ and a CUDA-capable PyTorch installation are recommended.
 
 ```powershell
 python -m venv .venv
@@ -76,22 +43,47 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-The default model identifier is `Qwen/Qwen3.5-9B`. Every training and
-evaluation script accepts `--base-model`, so a local model directory or
-another compatible causal LM can be used.
+The default model is `Qwen/Qwen3.5-9B`. Pass `--base-model` to use a local
+model directory or another compatible causal LM.
 
-## Data
+## Prepare Data
 
-The repository includes prepared benchmark splits:
+Both benchmark variants use the same command:
 
-```text
-data/base/train.jsonl
-data/base/val.jsonl
-data/enhanced/train.jsonl
-data/enhanced/val.jsonl
+```powershell
+python prepare_hotpotqa_data.py --mode base
+python prepare_hotpotqa_data.py --mode enhanced `
+  --train-size 500 --val-size 150 --docs-per-task 30
 ```
 
-The tracked SFT datasets are the current staged dynamic path:
+Prepared splits are already included under `data/`.
+
+## Generate SFT
+
+One generator supports the three current training stages:
+
+```powershell
+# Joint routing/research/synthesis mixture
+python generate_hotpotqa_dynamic_mixture_sft_data.py `
+  --stage mixture `
+  --train-jsonl .\data\enhanced\train.jsonl `
+  --output .\data\sft\dynamic_mixture.jsonl `
+  --limit 300 --max-subtasks 2
+
+# Main-only evidence synthesis
+python generate_hotpotqa_dynamic_mixture_sft_data.py `
+  --stage synthesis `
+  --output .\data\sft\dynamic_synthesis.jsonl `
+  --limit 500
+
+# Main-only noisy-result verification
+python generate_hotpotqa_dynamic_mixture_sft_data.py `
+  --stage verifier `
+  --output .\data\sft\dynamic_verifier.jsonl `
+  --limit 500 --samples-per-task 3
+```
+
+The repository tracks the corresponding experiment datasets:
 
 ```text
 data/sft/hotpotqa_dynamic_mixture_sft_data_300_v3.jsonl
@@ -99,86 +91,56 @@ data/sft/hotpotqa_dynamic_synthesis_sft_data_500.jsonl
 data/sft/hotpotqa_dynamic_verifier_sft_data_500.jsonl
 ```
 
-Older direct/fixed/dynamic-v1 SFT files are intentionally not tracked. They can
-be regenerated with the corresponding `generate_*.py` scripts when a historical
-baseline needs to be reproduced.
-
-To regenerate them:
-
-```powershell
-python prepare_hotpotqa_data.py --output-dir .\data\base
-python prepare_hotpotqa_enhanced_data.py --output-dir .\data\enhanced
-```
-
-## Dynamic MAS SFT
-
-Generate mixed routing, Sub research, and Main synthesis supervision:
-
-```powershell
-python generate_hotpotqa_dynamic_mixture_sft_data.py `
-  --train-jsonl .\data\enhanced\train.jsonl `
-  --output .\data\sft\dynamic_mixture.jsonl `
-  --limit 300 `
-  --max-subtasks 2
-```
-
-Train both adapters:
+## Train SFT
 
 ```powershell
 python sft_trainer.py `
-  --data-path .\data\sft\dynamic_mixture.jsonl `
+  --data-path .\data\sft\hotpotqa_dynamic_mixture_sft_data_300_v3.jsonl `
   --save-dir .\artifacts\checkpoints\dynamic_sft `
-  --base-model Qwen/Qwen3.5-9B `
-  --epochs 1 `
-  --max-length 1536
+  --epochs 1 --max-length 1536
 ```
 
-## Evaluation
+Use `--no-train-main`, `--no-train-sub`, `--main-lora`, and `--sub-lora` for
+staged continuation or ablation.
+
+## Evaluate
 
 ```powershell
 python analyze_hotpotqa_dynamic_mas_results.py `
-  --base-model Qwen/Qwen3.5-9B `
   --main-lora .\artifacts\checkpoints\dynamic_sft\main_agent `
   --sub-lora .\artifacts\checkpoints\dynamic_sft\sub_agent `
   --val-jsonl .\data\enhanced\val.jsonl `
-  --tasks 20 `
-  --samples 2 `
-  --max-subagents 2
+  --tasks 20 --samples 2 --max-subagents 2
 ```
 
-Primary metrics are answer F1, evidence accuracy, total reward, valid tool
-rate, direct rate, and average delegated subtask count.
+Metrics include answer F1, evidence accuracy, total reward, valid tool rate,
+direct rate, and average delegated subtask count.
 
-## GRPO
+## Train GRPO
 
-The local shared-model implementation is:
-
-```text
-grpo_hotpotqa_mas.py
+```powershell
+python grpo_hotpotqa_mas.py `
+  --main-lora .\artifacts\checkpoints\dynamic_sft\main_agent `
+  --sub-lora .\artifacts\checkpoints\dynamic_sft\sub_agent `
+  --train-jsonl .\data\enhanced\train.jsonl `
+  --val-jsonl .\data\enhanced\val.jsonl `
+  --save-dir .\artifacts\checkpoints\dynamic_grpo
 ```
 
-`grpo_hotpotqa.py` is retained only as the direct/single-trajectory baseline.
-The former TRL single-policy prototype was removed because it did not implement
-the Main/Sub architecture and duplicated the direct baseline.
+Run Main-only and Sub-only ablations before joint training. Do not select a
+checkpoint using training reward alone.
 
-Do not start joint GRPO from an unstable SFT checkpoint. The recommended
-experimental order is:
-
-```text
-dynamic SFT
--> held-out routing/Sub/synthesis evaluation
--> Main-only or Sub-only RL ablation
--> joint RL
-```
+Important: the current GRPO trainer still uses the older fixed
+`Main -> one Sub -> Main answer` rollout. Dynamic `direct/delegate 1..N`
+behavior is currently implemented in SFT generation and evaluation, but not
+yet in the GRPO rollout. Porting GRPO to that dynamic protocol is the next
+architecture task.
 
 ## Current Findings
 
-- Fixed MAS can outperform direct Main in the enhanced environment when the
-  Sub retrieval policy is strong.
-- Dynamic routing can learn to emit multiple focused subtasks.
-- Existing dynamic checkpoints tend to over-delegate and Main synthesis
-  remains a bottleneck.
-- Historical reward-filtered updates are not equivalent to strict GRPO.
+- Harder 30-document contexts make Sub research useful.
+- Dynamic routing learns focused subtasks but tends to over-delegate.
+- Main synthesis remains the largest bottleneck.
+- Joint RL has not yet shown stable held-out improvement over staged SFT.
 
-See [docs/ENHANCED_HOTPOTQA_EVAL_REPORT.md](docs/ENHANCED_HOTPOTQA_EVAL_REPORT.md)
-and [docs/HOTPOTQA_MGRPO_REPORT.md](docs/HOTPOTQA_MGRPO_REPORT.md) for details.
+Detailed experiment history remains in `docs/`.

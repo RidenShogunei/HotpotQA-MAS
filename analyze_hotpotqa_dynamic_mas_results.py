@@ -9,16 +9,75 @@ import random
 import re
 
 import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from analyze_hotpotqa_mas_results import (
-    build_prompt,
-    extract_tool_call,
-    generate_one,
-    history_text,
-    load_model,
-)
 from generate_hotpotqa_mas_sft_data import MAIN_ANSWER_SYSTEM, SUB_ACTION_SYSTEM, SUB_SUMMARY_SYSTEM
 from hotpotqa_environment import HotpotQAEnvironment
+
+
+def load_model(base_model: str, main_lora: str, sub_lora: str, device: str):
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        trust_remote_code=True,
+        device_map={"": device},
+        low_cpu_mem_usage=True,
+    )
+    model = PeftModel.from_pretrained(model, main_lora, adapter_name="main")
+    model.load_adapter(sub_lora, adapter_name="sub")
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model.eval()
+    return model, tokenizer
+
+
+def build_prompt(tokenizer, system: str, user: str):
+    return tokenizer.apply_chat_template(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def generate_one(model, tokenizer, adapter: str, prompt: str, device: str, max_tokens: int):
+    model.set_adapter(adapter)
+    prefix = "<thinking>"
+    inputs = tokenizer(prompt + prefix, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=0.4,
+            top_p=0.9,
+            do_sample=True,
+            repetition_penalty=1.05,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    generated = tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    ).strip()
+    text = prefix + generated
+    end = text.find("</result>")
+    return (text[: end + len("</result>")] if end >= 0 else text).strip()
+
+
+def history_text(history):
+    if not history:
+        return "No observations yet."
+    lines = []
+    for index, (tool_call, observation) in enumerate(history, 1):
+        lines.append(f"Step {index} tool call: {tool_call}")
+        lines.append(f"Step {index} observation: {observation}")
+    return "\n".join(lines)
+
+
+def extract_tool_call(text: str) -> str:
+    match = re.search(r"\[tool_call\].*?\[/tool_call\]", text, re.DOTALL)
+    return match.group(0) if match else text
 
 
 def doc_catalog(task) -> str:

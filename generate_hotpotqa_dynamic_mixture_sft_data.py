@@ -24,6 +24,8 @@ from generate_hotpotqa_mas_sft_data import (
     history_text,
 )
 from hotpotqa_environment import HotpotQAEnvironment, HotpotTask
+from generate_hotpotqa_dynamic_synthesis_sft_data import build_synthesis_sample
+from generate_hotpotqa_dynamic_verifier_sft_data import build_verifier_sample
 
 
 def focused_call_plan(task: HotpotTask, doc_id: str, title: str):
@@ -164,6 +166,7 @@ def build_samples_for_task(task: HotpotTask, idx: int, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate replay/mixture dynamic HotpotQA MAS SFT data.")
+    parser.add_argument("--stage", choices=["mixture", "synthesis", "verifier"], default="mixture")
     parser.add_argument("--train-jsonl", default="./data/enhanced/train.jsonl")
     parser.add_argument("--output", default="data/sft/hotpotqa_dynamic_mixture_sft_data.jsonl")
     parser.add_argument("--limit", type=int, default=None)
@@ -172,15 +175,38 @@ def parse_args():
     parser.add_argument("--dynamic-fraction", type=float, default=1.0)
     parser.add_argument("--answer-fraction", type=float, default=1.0)
     parser.add_argument("--direct-fraction", type=float, default=0.0)
+    parser.add_argument("--max-snippet-chars", type=int, default=360)
+    parser.add_argument("--samples-per-task", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=123)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     env = HotpotQAEnvironment.from_jsonl(args.train_jsonl, limit=args.limit)
-    samples = []
-    for idx, task in enumerate(env.tasks):
-        samples.extend(build_samples_for_task(task, idx, args))
+    if args.stage == "synthesis":
+        samples = [
+            build_synthesis_sample(task, args.max_subtasks, args.max_snippet_chars)
+            for task in env.tasks
+        ]
+    elif args.stage == "verifier":
+        import random
+
+        rng = random.Random(args.seed)
+        variants = ["gold_only", "wrong_first", "distractor_extra", "partial_plus_distractor"]
+        samples = []
+        for idx, task in enumerate(env.tasks):
+            for sample_idx in range(args.samples_per_task):
+                variant = variants[(idx + sample_idx) % len(variants)]
+                samples.append(
+                    build_verifier_sample(
+                        task, rng, variant, args.max_subtasks, args.max_snippet_chars
+                    )
+                )
+    else:
+        samples = []
+        for idx, task in enumerate(env.tasks):
+            samples.extend(build_samples_for_task(task, idx, args))
 
     out = Path(args.output)
     with open(out, "w", encoding="utf-8") as f:
@@ -192,10 +218,10 @@ def main():
     stage_counts = {}
     for sample in samples:
         stage_counts[sample.get("stage", "?")] = stage_counts.get(sample.get("stage", "?"), 0) + 1
-    print(f"[hotpotqa-dynamic-mixture-sft] wrote {len(samples)} samples to {out}")
-    print(f"[hotpotqa-dynamic-mixture-sft] main={main_count}")
-    print(f"[hotpotqa-dynamic-mixture-sft] sub={sub_count}")
-    print(f"[hotpotqa-dynamic-mixture-sft] stages={json.dumps(stage_counts, sort_keys=True)}")
+    print(f"[hotpotqa-sft:{args.stage}] wrote {len(samples)} samples to {out}")
+    print(f"[hotpotqa-sft:{args.stage}] main={main_count}")
+    print(f"[hotpotqa-sft:{args.stage}] sub={sub_count}")
+    print(f"[hotpotqa-sft:{args.stage}] stages={json.dumps(stage_counts, sort_keys=True)}")
 
 
 if __name__ == "__main__":
