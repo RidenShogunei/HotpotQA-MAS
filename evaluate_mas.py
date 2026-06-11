@@ -48,7 +48,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import TrainingConfig
-from hotpotqa_environment import HotpotQAEnvironment, HotpotTask
+from hotpotqa_environment import HotpotQAEnvironment, HotpotTask, HotpotDoc
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -141,30 +141,23 @@ class EvaluationSummary:
 def load_model(base_model_path: str, adapter_path: Optional[str] = None,
                device: str = "cuda") -> Tuple[Any, Any]:
     """Load base model with optional LoRA adapter."""
+    # Resolve to local path if available
+    from config import _find_local_model
+    local_path = _find_local_model(base_model_path)
+    if local_path != base_model_path:
+        print(f"[system] Resolved base model to local path: {local_path}")
+        base_model_path = local_path
+    
     print(f"[system] Loading base model: {base_model_path}")
     
-    tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_path, trust_remote_code=True, local_files_only=True
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Multi-GPU device map for Qwen3.5-9B
-    if "Qwen3.5" in base_model_path or "qwen3.5" in base_model_path.lower():
-        num_layers = 32
-        device_map = {
-            "model.embed_tokens": 4,
-            "model.rotary_emb": 4,
-            "model.norm": 6,
-            "lm_head": 6,
-        }
-        for i in range(num_layers):
-            if i < num_layers // 3:
-                device_map[f"model.layers.{i}"] = 4
-            elif i < 2 * num_layers // 3:
-                device_map[f"model.layers.{i}"] = 5
-            else:
-                device_map[f"model.layers.{i}"] = 6
-    else:
-        device_map = "auto"
+    # Use single GPU for inference (avoid multi-GPU communication overhead)
+    device_map = {"": 4}  # GPU 4 has enough memory for Qwen3.5-9B + LoRA
     
     model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
@@ -172,12 +165,15 @@ def load_model(base_model_path: str, adapter_path: Optional[str] = None,
         device_map=device_map,
         low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
+        local_files_only=True,
     )
     
     if adapter_path and os.path.exists(adapter_path):
         print(f"[system] Loading adapter: {adapter_path}")
-        model = PeftModel.from_pretrained(model, adapter_path, adapter_name="eval")
-        model.set_adapter("eval")
+        # Use a unique adapter name based on path to avoid conflicts
+        adapter_name = Path(adapter_path).name
+        model = PeftModel.from_pretrained(model, adapter_path, adapter_name=adapter_name)
+        model.set_adapter(adapter_name)
     
     model.eval()
     return model, tokenizer
@@ -188,7 +184,7 @@ def load_model(base_model_path: str, adapter_path: Optional[str] = None,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def generate(model, tokenizer, prompt: str, system: str = "",
-             max_new_tokens: int = 256, temperature: float = 0.3) -> Tuple[str, int]:
+             max_new_tokens: int = 256, temperature: float = 0.0) -> Tuple[str, int]:
     """Generate text and return (output, token_count)."""
     if system:
         messages = [
@@ -201,7 +197,7 @@ def generate(model, tokenizer, prompt: str, system: str = "",
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
     
-    # Move to model device
+    # Move to model device (single GPU)
     embed_device = model.get_input_embeddings().weight.device
     inputs = {k: v.to(embed_device) for k, v in inputs.items()}
     
@@ -211,9 +207,7 @@ def generate(model, tokenizer, prompt: str, system: str = "",
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0,
-            temperature=temperature if temperature > 0 else None,
-            top_p=0.9 if temperature > 0 else None,
+            do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -229,32 +223,75 @@ def generate(model, tokenizer, prompt: str, system: str = "",
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_mode(text: str) -> str:
-    """Extract [mode]direct[/mode] or [mode]delegate[/mode]."""
+    """Extract [mode]direct[/mode] or [mode]delegate[/mode].
+    Falls back to keyword detection if tags not found."""
     m = re.search(r'\[mode\](\w+)\[/mode\]', text, re.IGNORECASE)
-    return m.group(1).lower() if m else "unknown"
+    if m:
+        return m.group(1).lower()
+    
+    # Fallback: detect keywords in text
+    lower = text.lower()
+    if "delegate" in lower or "subtask" in lower or "research" in lower:
+        return "delegate"
+    elif "direct" in lower or "answer directly" in lower:
+        return "direct"
+    return "delegate"  # Default to delegate for complex questions
 
 
 def extract_subtasks(text: str) -> List[str]:
-    """Extract [subtask]...[/subtask] blocks."""
-    return re.findall(r'\[subtask\](.*?)\[/subtask\]', text, re.DOTALL)
+    """Extract [subtask]...[/subtask] blocks.
+    Falls back to bullet points or numbered lists."""
+    subtasks = re.findall(r'\[subtask\](.*?)\[/subtask\]', text, re.DOTALL)
+    if subtasks:
+        return [s.strip() for s in subtasks]
+    
+    # Fallback: look for bullet points or numbered items that look like subtasks
+    lines = text.split('\n')
+    for line in lines:
+        line = line.strip()
+        # Match bullet points or numbered items
+        if re.match(r'^[\*\-\d\.\)]\s+', line) and len(line) > 10:
+            subtasks.append(re.sub(r'^[\*\-\d\.\)\s]+', '', line).strip())
+    
+    return subtasks
 
 
 def extract_result(text: str) -> Tuple[str, List[str]]:
-    """Extract <result>answer | evidence: DOCID, DOCID</result>."""
+    """Extract <result>answer | evidence: DOCID, DOCID</result>.
+    Falls back to extracting the last sentence/line as answer."""
     matches = re.findall(r'<result>\s*(.*?)\s*</result>', text, re.DOTALL)
-    if not matches:
-        return "", []
+    if matches:
+        result = matches[-1].strip()
+        parts = re.split(r'\|\s*evidence\s*:', result, maxsplit=1, flags=re.IGNORECASE)
+        answer = parts[0].strip()
+        doc_ids = []
+        if len(parts) > 1:
+            doc_ids = sorted(set(re.findall(r'\bD\d{2}\b', parts[1])))
+        return answer, doc_ids
     
-    result = matches[-1].strip()
-    # Split answer and evidence
-    parts = re.split(r'\|\s*evidence\s*:', result, maxsplit=1, flags=re.IGNORECASE)
-    answer = parts[0].strip()
+    # Fallback: extract last non-empty line as answer
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
     
-    doc_ids = []
-    if len(parts) > 1:
-        doc_ids = sorted(set(re.findall(r'\bD\d{2}\b', parts[1])))
+    # Common instruction/prompt words to skip
+    skip_prefixes = (
+        'thinking', 'process', 'analyze', 'step', 'summary', 'synthesize',
+        '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.',
+        '*', '-', '•', 'answer', 'final', 'result', 'conclusion',
+        'based on', 'according to', 'the answer is', 'therefore',
+    )
     
-    return answer, doc_ids
+    if lines:
+        # Skip lines that look like instructions or formatting
+        for line in reversed(lines):
+            lower = line.lower()
+            if not lower.startswith(skip_prefixes) and len(line) > 2:
+                # Also skip if it's just a single word that's likely a section header
+                if len(line.split()) > 1 or len(line) > 15:
+                    return line, []
+        # If all lines are filtered, return the last one anyway
+        return lines[-1], []
+    
+    return "", []
 
 
 def extract_tool_call(text: str) -> Optional[Tuple[str, str]]:
@@ -366,13 +403,16 @@ class MASEvaluator:
     """Evaluator for Multi-Agent System on HotpotQA."""
     
     def __init__(self, main_model, main_tokenizer, sub_model, sub_tokenizer,
-                 max_sub_steps: int = 5, max_subtasks: int = 3):
+                 max_sub_steps: int = 5, max_subtasks: int = 3,
+                 main_generate_fn=None, sub_generate_fn=None):
         self.main_model = main_model
         self.main_tokenizer = main_tokenizer
         self.sub_model = sub_model
         self.sub_tokenizer = sub_tokenizer
         self.max_sub_steps = max_sub_steps
         self.max_subtasks = max_subtasks
+        self._main_generate = main_generate_fn or generate
+        self._sub_generate = sub_generate_fn or generate
     
     def evaluate_task(self, task: HotpotTask, no_subagent: bool = False) -> EpisodeResult:
         """Evaluate a single task."""
@@ -397,8 +437,7 @@ Document catalog:
 Should you answer directly or delegate research?"""
         
         start_time = time.time()
-        plan_output, plan_tokens = generate(
-            self.main_model, self.main_tokenizer,
+        plan_output, plan_tokens = self._main_generate(
             plan_prompt, system=MAIN_PLAN_SYSTEM,
             max_new_tokens=256
         )
@@ -419,8 +458,7 @@ Document catalog:
 Answer directly."""
             
             start_time = time.time()
-            answer_output, answer_tokens = generate(
-                self.main_model, self.main_tokenizer,
+            answer_output, answer_tokens = self._main_generate(
                 answer_prompt, system=DIRECT_ANSWER_SYSTEM,
                 max_new_tokens=256
             )
@@ -462,8 +500,7 @@ Subagent research results:
 Synthesize the final answer."""
             
             start_time = time.time()
-            answer_output, answer_tokens = generate(
-                self.main_model, self.main_tokenizer,
+            answer_output, answer_tokens = self._main_generate(
                 synthesis_prompt, system=MAIN_ANSWER_SYSTEM,
                 max_new_tokens=256
             )
@@ -502,8 +539,7 @@ Use search and read tools to find evidence."""
         
         for step in range(self.max_sub_steps):
             start_time = time.time()
-            output, tokens = generate(
-                self.sub_model, self.sub_tokenizer,
+            output, tokens = self._sub_generate(
                 sub_prompt + "\n\n" + "\n".join(conversation),
                 system=SUB_ACTION_SYSTEM,
                 max_new_tokens=128
@@ -528,8 +564,7 @@ Use search and read tools to find evidence."""
         
         # Final summary
         start_time = time.time()
-        summary_output, summary_tokens = generate(
-            self.sub_model, self.sub_tokenizer,
+        summary_output, summary_tokens = self._sub_generate(
             sub_prompt + "\n\n" + "\n".join(conversation) + "\n\nSummarize your findings.",
             system=SUB_SUMMARY_SYSTEM,
             max_new_tokens=128
@@ -764,6 +799,9 @@ def save_results(summary: EvaluationSummary, output_path: str):
                 "total_tokens": e.total_tokens,
                 "total_latency_ms": e.total_latency_ms,
                 "failure_mode": e.failure_mode,
+                "main_plan_output": e.main_plan_output,
+                "main_answer_output": e.main_answer_output,
+                "subtask_results": e.subtask_results,
             }
             for e in summary.episodes
         ]
@@ -819,29 +857,114 @@ def main():
     print("Loading Models")
     print("="*70)
     
-    # Main model
-    main_model, main_tokenizer = load_model(args.base_model, args.main_lora, args.device)
+    # Load base model ONCE
+    base_model, tokenizer = load_model(args.base_model, None, args.device)
     
-    # Sub model (same base, different adapter if provided)
-    if args.no_subagent:
-        sub_model, sub_tokenizer = main_model, main_tokenizer
+    # Load first adapter to create PeftModel, then load second adapter
+    from peft import PeftModel
+    
+    # Load Main adapter first (creates PeftModel wrapper)
+    if args.main_lora and os.path.exists(args.main_lora):
+        print(f"[system] Loading Main adapter: {args.main_lora}")
+        main_adapter_name = Path(args.main_lora).name
+        base_model = PeftModel.from_pretrained(base_model, args.main_lora, adapter_name=main_adapter_name)
     else:
-        sub_model, sub_tokenizer = load_model(args.base_model, args.sub_lora, args.device)
+        main_adapter_name = None
+    
+    # Load Sub adapter on same PeftModel
+    if not args.no_subagent and args.sub_lora and os.path.exists(args.sub_lora):
+        print(f"[system] Loading Sub adapter: {args.sub_lora}")
+        sub_adapter_name = Path(args.sub_lora).name
+        base_model.load_adapter(args.sub_lora, adapter_name=sub_adapter_name)
+    else:
+        sub_adapter_name = None
+    
+    base_model.eval()
+    
+    # Create wrapper functions that switch adapters
+    def main_generate(*args, **kwargs):
+        if main_adapter_name:
+            base_model.set_adapter(main_adapter_name)
+        return generate(base_model, tokenizer, *args, **kwargs)
+    
+    def sub_generate(*args, **kwargs):
+        if sub_adapter_name:
+            base_model.set_adapter(sub_adapter_name)
+        else:
+            base_model.set_adapter(main_adapter_name)
+        return generate(base_model, tokenizer, *args, **kwargs)
+    
+    # Monkey-patch the generate function for evaluator
+    import evaluate_mas
+    evaluate_mas.generate = main_generate  # Main uses main adapter by default
     
     # Run evaluation
     print("\n" + "="*70)
     print("Starting Evaluation")
     print("="*70)
     
-    summary = evaluate_dataset(
-        args.data,
-        main_model, main_tokenizer,
-        sub_model, sub_tokenizer,
-        max_tasks=args.tasks,
-        no_subagent=args.no_subagent,
+    # Load tasks
+    tasks = []
+    with open(args.data, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = json.loads(line.strip())
+            docs = [
+                HotpotDoc(
+                    doc_id=doc["doc_id"],
+                    title=doc["title"],
+                    text=doc["text"],
+                    sentences=doc.get("sentences", []),
+                )
+                for doc in raw["docs"]
+            ]
+            tasks.append(HotpotTask(
+                task_id=raw["task_id"],
+                question=raw["question"],
+                answer=raw["answer"],
+                support_doc_ids=raw.get("support_doc_ids", []),
+                support_titles=raw.get("support_titles", []),
+                docs=docs,
+                level=raw.get("level", ""),
+                task_type=raw.get("type", ""),
+            ))
+    
+    if args.tasks:
+        tasks = tasks[:args.tasks]
+    
+    print(f"[system] Evaluating on {len(tasks)} tasks...")
+    
+    # Initialize evaluator with adapter-switching generate
+    evaluator = MASEvaluator(
+        base_model, tokenizer,
+        base_model, tokenizer,
         max_sub_steps=args.max_sub_steps,
         max_subtasks=args.max_subtasks,
+        main_generate_fn=main_generate,
+        sub_generate_fn=sub_generate,
     )
+    
+    # Run episodes
+    summary = EvaluationSummary()
+    summary.total_tasks = len(tasks)
+    
+    for i, task in enumerate(tasks):
+        print(f"\n[{i+1}/{len(tasks)}] Task {task.task_id}: {task.question[:60]}...")
+        
+        result = evaluator.evaluate_task(task, no_subagent=args.no_subagent)
+        summary.episodes.append(result)
+        
+        status = "✓" if result.exact_match else "✗"
+        print(f"  {status} Pred: {result.predicted_answer or '(empty)'} | Gold: {task.answer}")
+        print(f"     F1: {result.f1_score:.2f} | EM: {result.exact_match}")
+        print(f"     Delegated: {result.delegated} | Subtasks: {result.num_subtasks}")
+        print(f"     Docs: R={result.doc_recall:.2f} P={result.doc_precision:.2f}")
+        print(f"     Tokens: {result.total_tokens} | Latency: {result.total_latency_ms:.0f}ms")
+        
+        if result.failure_mode:
+            print(f"     Failure: {result.failure_mode}")
+    
+    # Aggregate results
+    _aggregate_results(summary)
     
     # Print and save results
     print_summary(summary)
